@@ -17,5 +17,16 @@
     "interval_secs":  20,    
     "overlap_secs":   10,    
     "output_var":     "HTI"
+  },
+  {
+    "name":           "PLETH - Predicción Presión Arterial",
+    "path":           "models/pleth_bp_predictor.py",
+    "input_type":     "wave",
+    "signal_track":   "Demo/PLETH",
+    "signal_length":  500,
+    "resample_rate":  100,
+    "interval_secs":  5,
+    "overlap_secs":   2,
+    "output_var":     "BP_Prediction"
   }
 ]

@@ -3,7 +3,7 @@ import sys
 import arr
 import torch
 import numpy as np
-import pandas as pd
+import polars as pd
 import pickle
 import torch.nn as nn
 

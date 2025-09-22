@@ -73,7 +73,8 @@ class VitalApp:
     def _log_tail(self, df):
         self.log.configure(state='normal')
         self.log.insert(tk.END, 'New iteration \n')
-        for line in df.tail(3).to_string(index=False).splitlines():
+        for row in df.tail(3).to_dicts():
+            line = ' '.join([f"{k}: {v}" for k,v in row.items()])
             self.log.insert(tk.END, line + '\n')
         self.log.configure(state='disabled')
 
