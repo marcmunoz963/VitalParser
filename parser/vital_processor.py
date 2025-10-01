@@ -225,12 +225,12 @@ class VitalProcessor:
         # Resto del código igual
         df_preds = pd.DataFrame(records).unique(subset=['Tiempo'], keep='last')
     
-        # Cargar all_tracks en chunks si es necesario, pero para simplicidad asumir que cabe
-        all_tracks = vf.get_track_names()
-        raw_all = vf.to_numpy(all_tracks, interval=0, return_timestamp=True)
+        # Cargar unicamente las tracks necesarias para los modelos wave segun model.json
+        tracks = [model_config.get('signal_track') for model_config in self.model_configs if model_config.get('input_type') == 'wave']
+        raw_all = vf.to_numpy(tracks, interval=0, return_timestamp=True)
         # Separar columnas
         column_data = {}
-        for idx, name in enumerate(['Tiempo'] + all_tracks):
+        for idx, name in enumerate(['Tiempo'] + tracks):
             try:
                 col = raw_all[:, idx]
                 if name == 'Tiempo':
