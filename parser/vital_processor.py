@@ -136,7 +136,8 @@ class VitalProcessor:
         xlsx_path = os.path.join(self.results_dir, f"{base}_wave.xlsx")
         first = not os.path.exists(xlsx_path)
     
-        vf = VitalFile(vital_path)
+        # Cargar unicamente las tracks necesarias para los modelos wave segun model.json
+        vf = VitalFile(vital_path, [model_config.get('signal_track') for model_config in self.model_configs if model_config.get('input_type') == 'wave'])
         records = []
         
         # Tiempo de inicio del procesamiento para control de tiempo real
@@ -225,8 +226,7 @@ class VitalProcessor:
         # Resto del código igual
         df_preds = pd.DataFrame(records).unique(subset=['Tiempo'], keep='last')
     
-        # Cargar unicamente las tracks necesarias para los modelos wave segun model.json
-        tracks = [model_config.get('signal_track') for model_config in self.model_configs if model_config.get('input_type') == 'wave']
+        tracks = vf.get_track_names()
         raw_all = vf.to_numpy(tracks, interval=0, return_timestamp=True)
         # Separar columnas
         column_data = {}
