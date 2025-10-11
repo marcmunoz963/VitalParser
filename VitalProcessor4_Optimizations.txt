@@ -1,0 +1,33 @@
+PROJECT SUMMARY – VitalProcessor4 Optimizations
+
+Aquest fitxer descriu les principals millores implementades en la nova versió de `vital_processor4.py` per optimitzar el processament de dades fisiològiques en format `.vital`. 
+
+🔹 OBJECTIU GENERAL
+Reduir el temps d'execució i el consum de memòria durant el processament de senyals (wave mode) i dades tabulars (tabular mode), mantenint compatibilitat amb el flux de treball existent.
+
+🔹 MILLORAMENTS CLAUS
+1. **Càrrega selectiva de dades**  
+   Només es carreguen les pistes (tracks) necessàries per als models de senyals, evitant llegir tot el fitxer `.vital` a memòria.
+
+2. **Ús de Polars per a DataFrames**  
+   Substitució de Pandas per Polars, que permet càlculs vectoritzats i joins molt més ràpids, reduint el temps de fusió de dades i prediccions.
+
+3. **Escriptura incremental a CSV**  
+   Els resultats es guarden incrementalment en lloc de reescriure tot el fitxer cada vegada. Això redueix significativament l'I/O de disc i permet processament continu o en temps real.
+
+4. **Processament en chunks (fragments)**  
+   Les senyals llargues es processen per intervals de temps predefinits per controlar l'ús de memòria i aprofitar el paral·lelisme amb `ThreadPoolExecutor`.
+
+5. **Memòria cau de dades (cache)**  
+   Les senyals carregades es mantenen en memòria per evitar lectures repetides del mateix fitxer.
+
+6. **Sincronització d'estat**  
+   Es desa un fitxer `state_wave.json` amb el darrer temps processat per a cada fitxer `.vital` per evitar recomputació i permetre processament incremental.
+
+7. **Control d'errors i traça millorat**  
+   Afegits missatges `[TRACE]`, `[DEBUG]`, `[WARN]`, `[INFO]` i `[ERROR]` per a un seguiment més clar del flux de processament i diagnosi d’errors.
+
+🔹 RESULTATS
+Aquestes optimitzacions redueixen el temps de processament inicial, permeten reanudar execucions sense repetir càlculs i faciliten l’ús en entorns de simulació de streaming.
+
+Per contra, per alguna raó no troba dades dins els fitxers .vital ==> REVISAR
