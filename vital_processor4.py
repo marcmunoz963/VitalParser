@@ -10,6 +10,7 @@
 # - Memòria cau de dades: es manté en memòria la senyal carregada per cada track per evitar lectures redundants.
 # - Sincronització i estat: es guarda l'últim segment processat per a cada arxiu per evitar recomputació.
 # ==================================================================================================
+# ==================================================================================================
 import os
 import numpy as np
 import polars as pd
@@ -24,22 +25,32 @@ from concurrent.futures import ThreadPoolExecutor
 import gc
 import time
 
+# Debug flag for verbose output
+DEBUG = os.environ.get("VITAL_DEBUG", "0") == "1"
+
+# --- helper per normalitzar timestamps ---
+def _ts_to_ms(ts_array):
+    """Converteix timestamps (float segons) a int64 mil·lisegons per joins i CSV estables."""
+    return (np.asarray(ts_array, dtype=np.float64) * 1000.0).round().astype(np.int64)
+
 
 def process_segment(cfg, start_time, vf, arr_utils, all_data):
     interval_s = cfg['interval_secs']
-    print(f"[TRACE] process_segment() iniciat amb start_time={start_time:.2f}s per {cfg.get('signal_track')}")
+    if os.environ.get("VITAL_TRACE") == "1":
+        print(f"[TRACE] process_segment() iniciat amb start_time={start_time:.2f}s per {cfg.get('signal_track')}")
 
     # Millora: reutilitzar la senyal carregada per evitar recarregar-la múltiples vegades
     if all_data is None or all_data.shape[0] == 0:
         print(f"[ERROR] Debug: No es va passar la senyal per {cfg['signal_track']}")
         return None
 
-    # Càlcul d'índexs basat en la durada i la freqüència aproximada
-    sample_rate = len(all_data) / (all_data[-1, 0] - all_data[0, 0])  # aprox
-    start_idx = int(start_time * sample_rate)
-    end_idx = int((start_time + interval_s) * sample_rate)
+    # Selecció per timestamps (més robust que aproximar amb sample_rate)
+    ts_all = all_data[:, 0]
+    # start_time i interval_s estan en segons absoluts; fem servir cerca binària
+    start_idx = np.searchsorted(ts_all, start_time, side="left")
+    end_idx = np.searchsorted(ts_all, start_time + interval_s, side="left")
 
-    if end_idx > len(all_data):
+    if end_idx - start_idx <= 0 or end_idx > len(ts_all):
         return None
 
     segment_data = all_data[start_idx:end_idx]
@@ -51,25 +62,72 @@ def process_segment(cfg, start_time, vf, arr_utils, all_data):
 
     signal = arr_utils.interp_undefined(signal)
 
-    orig_rate = cfg.get('orig_rate', cfg['resample_rate'])
-    signal = arr_utils.resample_hz(signal, orig_rate, cfg['resample_rate'])
-    timestamps = arr_utils.resample_hz(timestamps, orig_rate, cfg['resample_rate'])
+    # --- Estimate original sampling rate from timestamps (robust) ---
+    dt = np.diff(timestamps)
+    if dt.size > 0:
+        dt = dt[np.isfinite(dt) & (dt > 0)]
+    orig_rate_est = float(np.median(1.0 / dt)) if dt.size > 0 else float(cfg.get('orig_rate', cfg['resample_rate']))
 
-    if len(signal) < cfg['signal_length']:
-        print(f"[ERROR] Debug: Señal demasiado corta: {len(signal)} < {cfg['signal_length']}")
+    target_rate = int(cfg['resample_rate'])
+    target_len_cfg = int(cfg['signal_length'])
+    expected_len = int(round(cfg['interval_secs'] * target_rate))
+    if expected_len != target_len_cfg:
+        print(f"[WARN] Config mismatch: interval_secs*resample_rate={expected_len} != signal_length={target_len_cfg}. Using signal_length as target length.")
+        expected_len = target_len_cfg
+
+    # --- Resample signal and timestamps to target rate ---
+    signal = arr_utils.resample_hz(signal, orig_rate_est, target_rate)
+    timestamps = arr_utils.resample_hz(timestamps, orig_rate_est, target_rate)
+
+    # --- Enforce exact target length (pad/trim) ---
+    cur_len = len(signal)
+    if cur_len < expected_len:
+        pad_n = expected_len - cur_len
+        if cur_len > 0:
+            # Edge padding requires no constant_values argument
+            signal = np.pad(signal, (0, pad_n), mode='edge')
+            timestamps = np.pad(timestamps, (0, pad_n), mode='edge')
+        else:
+            # Empty segment: fall back to constant padding
+            pad_val_sig = 0.0
+            pad_val_ts = timestamps[0] if len(timestamps) > 0 else start_time
+            signal = np.pad(signal, (0, pad_n), mode='constant', constant_values=(pad_val_sig, pad_val_sig))
+            timestamps = np.pad(timestamps, (0, pad_n), mode='constant', constant_values=(pad_val_ts, pad_val_ts))
+    elif cur_len > expected_len:
+        signal = signal[:expected_len]
+        timestamps = timestamps[:expected_len]
+
+    # Final safety check
+    if len(signal) != expected_len:
+        print(f"[ERROR] Debug: Longitud inesperada després del resampling: {len(signal)} != {expected_len}")
         return None
 
-    inp = signal[:cfg['signal_length']].reshape(1, 1, -1)
+    inp = signal.reshape(1, 1, -1)
     try:
         pred_result = cfg['model'].predict(inp)
-        pred = float(pred_result.squeeze())
-        return {'Tiempo': timestamps[cfg['signal_length'] - 1], cfg['output_var']: pred}
+        pred_val = float(pred_result.squeeze())
+        # Guardem el temps com a int64 (ms) per evitar problemes de join per flotants
+        ts_ms = _ts_to_ms([timestamps[cfg['signal_length'] - 1]])[0]
+        return {
+            'Tiempo': ts_ms,
+            cfg['output_var']: pred_val,
+            '_valid': np.isfinite(pred_val),
+            '_err': None,
+            '_track': cfg.get('signal_track'),
+        }
     except Exception as e:
-        print(f"[ERROR] Error en process_segment: {e}")
-        import traceback
-        traceback.print_exc()
-        print(f"[TRACE] process_segment() ha fallat per {cfg.get('signal_track')}: {e}")
-        return None
+        if os.environ.get("VITAL_TRACE") == "1" or DEBUG:
+            print(f"[ERROR] Error en process_segment ({cfg.get('signal_track')}): {e}")
+        # tornar un registre marcat com a error perquè puguem comptar-lo
+        last_ts = timestamps[-1] if len(timestamps) > 0 else start_time
+        ts_ms = _ts_to_ms([last_ts])[0]
+        return {
+            'Tiempo': ts_ms,
+            cfg['output_var']: None,
+            '_valid': False,
+            '_err': str(e),
+            '_track': cfg.get('signal_track'),
+        }
 
 
 class VitalProcessor:
@@ -91,12 +149,18 @@ class VitalProcessor:
         self.wave_last = {cfg.get('output_var'): None for cfg in model_configs if cfg.get('input_type')=='wave'}
         # Para rastrear el último tiempo procesado por archivo para sincronización en tiempo real
         self.last_processing_time = {}
-        """MODIFICAT"""
+        # MODIFICAT
         self.state_file = os.path.join(results_dir, "state_wave.json")
         if os.path.exists(self.state_file):
-          import json
-          with open(self.state_file, "r") as f:
-             self.last_processing_time = json.load(f)
+            import json
+            try:
+                with open(self.state_file, "r") as f:
+                    self.last_processing_time = json.load(f)
+                    if not isinstance(self.last_processing_time, dict):
+                        raise ValueError("state_wave.json no és un dict")
+            except Exception as e:
+                print(f"[WARN] Estat invàlid a state_wave.json. Es reinicia: {e}")
+                self.last_processing_time = {}
 
     def process_once(self, recordings_dir, mode='tabular'):
         if mode == 'tabular':
@@ -134,7 +198,7 @@ class VitalProcessor:
         csv_path = xlsx_path.replace(".xlsx", ".csv")
         # Millora: escriptura incremental CSV per evitar escriure tot de nou
         self._save_csv(df, csv_path, first)
-        """MODIFICAT"""
+        # MODIFICAT
         # Guardar estat de processament
         import json
         with open(self.state_file, "w") as f:
@@ -170,7 +234,7 @@ class VitalProcessor:
         records = []
 
         processing_start_time = time.time()
-        chunk_duration = 60  # Duración en segundos para cada chunk (configurable)
+        chunk_duration = 180  # Duración en segundos para cada chunk (ampliado para procesar más por pasada)
 
         # --------- INICI: memòria cau de dades per signal_track ---------
         all_data_cache = {}
@@ -190,54 +254,61 @@ class VitalProcessor:
                     continue
             all_data_full = all_data_cache[signal_track]
 
-            # Obtener duración total aproximada de la señal para segmentación
-            total_duration = len(vf.to_numpy([cfg['signal_track']], interval=1))
+            # === Durada i domini temporal reals (basat en timestamps del fitxer) ===
+            ts_all = all_data_full[:, 0]
+            if ts_all.size == 0:
+                print(f"[WARN] Sense timestamps per {signal_track}")
+                continue
+            min_ts = float(ts_all[0])
+            max_ts = float(ts_all[-1])
 
             interval_s = cfg['interval_secs']
             overlap_s = cfg['overlap_secs']
-            step_s = max(1, interval_s - overlap_s)
+            step_s = max(1e-3, float(interval_s - overlap_s))
 
-            # Generar todos los start_times posibles para segmentar la señal
-            all_start_times = np.arange(0, total_duration - interval_s, step_s) if total_duration > interval_s else []
+            # Generar start_times en el domini real (no assumim que comenci a 0)
+            if max_ts - min_ts > interval_s:
+                all_start_times = np.arange(min_ts, max_ts - interval_s, step_s, dtype=float)
+            else:
+                all_start_times = np.array([], dtype=float)
             if len(all_start_times) == 0:
                 continue
 
-            # Control para no reprocesar segmentos ya evaluados (sincronización en tiempo real)
+            # Sincronització: fem servir timestamps reals per recordar el darrer processat
             file_key = os.path.basename(vital_path)
-            last_processed = self.last_processing_time.get(file_key, 0)
+            last_processed = self.last_processing_time.get(file_key, min_ts - 1)
 
-            batch_size = 20  # Procesar en lotes pequeños para controlar uso de recursos
+            batch_size = 100  # Procesar más segmentos por lote (si recursos lo permiten)
 
-            if last_processed > 0:
+            if last_processed > min_ts:
                 remaining_start_times = all_start_times[all_start_times > last_processed]
                 if len(remaining_start_times) > 0:
                     start_times = remaining_start_times
-                    print(f"[INFO] Continuando desde {last_processed}s, {len(start_times)} segmentos pendientes")
+                    print(f"[INFO] Continuando desde {last_processed:.2f}s reales, {len(start_times)} segmentos pendientes")
                 else:
-                    # No hay segmentos nuevos, procesar últimos batch_size para mantener actualizado
+                    # No hay segmentos nuevos, procesar últimos batch_size
                     start_times = all_start_times[-batch_size:] if len(all_start_times) >= batch_size else all_start_times
                     print(f"[INFO] No hay segmentos nuevos, procesando últimos {len(start_times)} segmentos")
             else:
                 # Primera ejecución, procesar todo
                 start_times = all_start_times
-                print(f"[INFO] Primera ejecución: procesando desde el inicio ({len(start_times)} segmentos disponibles)")
+                print(f"[INFO] Primera ejecución: {len(start_times)} segmentos disponibles en [{min_ts:.2f}, {max_ts:.2f}]s")
 
             if len(start_times) == 0:
                 continue
+
             # -----------------------------------------------------------------------
-            # PROCESSAMENT EN CHUNKS (fragments) per controlar l'ús de memòria i
-            # aprofitar el paral·lelisme amb ThreadPoolExecutor.
-            # Cada chunk cobreix un interval de temps i només es carrega la finestra necessària.
+            # PROCESSAMENT EN CHUNKS en domini real
             # -----------------------------------------------------------------------
-            chunk_start_times = np.arange(0, total_duration, chunk_duration)
+            chunk_start_times = np.arange(min_ts, max_ts, chunk_duration, dtype=float)
             for chunk_start in chunk_start_times:
-                chunk_end = chunk_start + chunk_duration + interval_s  # Añadir interval_s para cubrir segmentos que cruzan límite chunk
-                # Filtrar start_times que caen dentro del chunk
+                chunk_end = chunk_start + chunk_duration + interval_s  # cobrir segments que travessen el límit
+                # Filtrar start_times que caen dentro del chunk (domini real)
                 chunk_segment_starts = start_times[(start_times >= chunk_start) & (start_times < chunk_end)]
                 if len(chunk_segment_starts) == 0:
                     continue
 
-                # Utilitzar la memòria cau de dades per obtenir el chunk del rang temporal
+                # Obtenir el subarray del rang temporal real
                 mask = (all_data_full[:, 0] >= chunk_start) & (all_data_full[:, 0] < chunk_end)
                 all_data_chunk = all_data_full[mask]
                 if all_data_chunk is None or len(all_data_chunk) == 0:
@@ -252,8 +323,24 @@ class VitalProcessor:
                     futures = [executor.submit(process_segment, cfg, st, vf, arr_utils, all_data_chunk) for st in chunk_segment_starts]
                     segment_results = [f.result() for f in futures]
 
-                valid_results = [res for res in segment_results if res is not None]
-                records.extend(valid_results)
+                # --- DEBUG: mètriques del chunk ---
+                total = len(segment_results)
+                errs = sum(1 for r in segment_results if r is not None and r.get('_err'))
+                valids = [r for r in segment_results if r is not None and r.get('_valid')]
+                n_valids = len(valids)
+                n_nans = sum(1 for r in segment_results if r is not None and (r.get('_valid') is False) and (r.get('_err') is None))
+
+                if DEBUG or os.environ.get("VITAL_TRACE") == "1":
+                    print(f"[DEBUG] {cfg['signal_track']} chunk: segs={total}, valids={n_valids}, nans={n_nans}, errors={errs}")
+
+                # Guardar-ho tot (també NaN i errors) per poder inspeccionar després
+                clean = []
+                for r in segment_results:
+                    if r is None:
+                        continue
+                    rec = {k: v for k, v in r.items() if not k.startswith('_')}
+                    clean.append(rec)
+                records.extend(clean)
                 gc.collect()
 
                 # Actualizar último tiempo procesado para evitar reprocesamientos
@@ -261,7 +348,8 @@ class VitalProcessor:
                     self.last_processing_time[file_key] = max(chunk_segment_starts)
 
                 current_elapsed = time.time() - processing_start_time
-                if current_elapsed > 80.0:
+                # Ampliem límit per permetre processar .vital grans d'una sola tirada
+                if current_elapsed > 600.0:
                     print(f"[INFO] Tiempo límite alcanzado ({current_elapsed:.1f}s), finalizando procesamiento")
                     break
             # -----------------------------------------------------------------------
@@ -277,45 +365,59 @@ class VitalProcessor:
             return None
         # Crear DataFrame con predicciones únicas por tiempo
         df_preds = pd.DataFrame(records).unique(subset=['Tiempo'], keep='last')
-
-        tracks = vf.get_track_names()
-        raw_all = vf.to_numpy(tracks, interval=0, return_timestamp=True)
-
-        # Preparar columnas para DataFrame, con manejo seguro de valores None
-        column_data = {}
-        for idx, name in enumerate(['Tiempo'] + tracks):
-            try:
-                col = raw_all[:, idx]
-                if name == 'Tiempo':
-                    column_data[name] = col  # Mantener como float para join
-                else:
-                    safe_col = [str(val) if val is not None else None for val in col]
-                    column_data[name] = safe_col
-            except Exception as e:
-                print(f"Error procesando columna {name}: {e}")
-                column_data[name] = [None] * len(raw_all)
-
-        df_all = pd.DataFrame(column_data)
-        """MODIFICAT"""
-        # Millora: join nadiu amb Polars per afegir les prediccions, evitant loops i mapes
-        df = df_all.join(df_preds, on="Tiempo", how="left")
-        self.latest_df = df.clone()
-        """MODIFICAT"""
-        # Filtrar files on totes les prediccions wave són nulles per evitar dades sense valor
+        # --- Simplificació: exportem només les files amb predicció (sense join a la timeline completa) ---
+        # Evitem buits per desajust de timestamps. Ens quedem amb df_preds, assegurant tipus/ordre.
+        df = df_preds.with_columns(
+        pd.col("Tiempo").cast(pd.Int64)
+        ).sort("Tiempo").unique(subset=["Tiempo"], keep="last")
+        # Assegurem que totes les columnes de sortida esperades existeixen encara que algun model no hagi retornat files
         wave_output_vars = [cfg['output_var'] for cfg in self.model_configs if cfg.get('input_type') == 'wave']
         if wave_output_vars:
-            df = df.filter(~pd.all_horizontal([pd.col(var).is_null() for var in wave_output_vars]))
+            for var in wave_output_vars:
+                if var not in df.columns:
+                    # crea la columna com a nulls (Float64) per evitar ColumnNotFoundError en el filtre
+                    df = df.with_columns(pd.lit(None).cast(pd.Float64).alias(var))
+
+        # --- Debug: comptar files amb almenys una predicció no nul·la ---
+        try:
+            _pred_rows = 0
+            if wave_output_vars:
+                _pred_rows = df.select(
+                    pd.any_horizontal([pd.col(var).is_not_null() for var in wave_output_vars]).alias("has_pred")
+                ).filter(pd.col("has_pred")).height
+            print(f"[DEBUG] Files amb alguna predicció no nul·la: {_pred_rows} / {df.height}")
+        except Exception as _e:
+            print(f"[WARN] No s'ha pogut calcular el recompte de files amb predicció: {_e}")
+
+        # Guardem el dataframe complet per la UI
+        self.latest_df = df.clone()
 
         csv_path = xlsx_path.replace(".xlsx", ".csv")
-        """MODIFICAT"""
-        # -------------------------------------------------------------
-        # ESCRIPTURA INCREMENTAL DEL CSV amb Polars:
-        # Només s'afegeixen les files noves al fitxer CSV, evitant reescriure tot el fitxer.
-        # Això redueix I/O i permet processament eficient en temps real o en lots.
-        # -------------------------------------------------------------
-        self._save_csv(df, csv_path, first)
+
+        if DEBUG:
+            # En mode DEBUG no filtrem res: volem veure totes les files generades
+            df_export = df.sort("Tiempo")
+            # Escriu també una còpia crua per inspecció
+            raw_path = xlsx_path.replace(".xlsx", "_raw.csv")
+            self._save_csv(df_export, raw_path, first)
+        else:
+            # NOMÉS EXPORTAR FILES AMB ALGUNA PREDICCIÓ no nul·la
+            wave_output_vars = [cfg['output_var'] for cfg in self.model_configs if cfg.get('input_type') == 'wave']
+            df_export = df
+            if wave_output_vars:
+                df_export = df.filter(
+                    pd.any_horizontal([pd.col(var).is_not_null() for var in wave_output_vars])
+                )
+
+        # ESCRIPTURA INCREMENTAL DEL CSV
+        self._save_csv(df_export, csv_path, first)
+        # Guardar estat de processament per wave
+        import json
+        with open(self.state_file, "w") as f:
+            json.dump(self.last_processing_time, f)
         return df
 
+    
     def _run_predictions(self, df: pd.DataFrame):
         for cfg in self.model_configs:
             if cfg.get('input_type') != 'tabular':
@@ -351,20 +453,52 @@ class VitalProcessor:
                         preds.append(np.nan)
 
             # Agregar columna de predicciones con sintaxis correcta de Polars
-            df = df.with_columns(pd.Series(cfg['output_var'], preds, dtype=pd.Float64))
+            df = df.with_columns(pd.Series(name=cfg['output_var'], values=preds).cast(pd.Float64))
         return df
-    """MODIFICAT"""
+    # MODIFICAT
     def _save_csv(self, df: pd.DataFrame, path: str, first: bool):
         """
         Escritura incremental en CSV:
-        - Si es la primera vez, crea archivo con cabecera.
-        - Si no, añade sólo las nuevas filas sin cabecera.
+        - Si és la primera vegada, crea arxiu amb capçaleres.
+        - Si no, afegeix només files noves (ordenades per "Tiempo") sense capçaleres.
         """
         if not isinstance(df, PLDataFrame):
             raise TypeError("Expected a Polars DataFrame")
 
+        # Ordena i elimina duplicats per seguretat
+        if "Tiempo" in df.columns:
+            df = df.sort("Tiempo").unique(subset=["Tiempo"], keep="last")
+
         if first or not os.path.exists(path):
             df.write_csv(path)
-        else:
-            with open(path, "a") as f:
-                df.write_csv(f, include_header=False)
+            return
+
+        # Mode append: intentem evitar duplicats llegint l'últim valor de Tiempo del fitxer existent
+        try:
+            # Llegim només l'última línia del CSV existent de forma eficient
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                # Retrocedeix fins trobar salt de línia
+                while pos > 0:
+                    pos -= 1
+                    f.seek(pos, os.SEEK_SET)
+                    if f.read(1) == b"\n":
+                        break
+                last_line = f.readline().decode(errors="ignore").strip()
+            if last_line:
+                # S'assumeix que la primera columna és Tiempo
+                last_ts = last_line.split(",", 1)[0]
+                try:
+                    last_ts = int(last_ts)
+                    df = df.filter(pd.col("Tiempo") > last_ts)
+                except ValueError:
+                    pass
+        except Exception as e:
+            print(f"[WARN] No s'ha pogut llegir l'última línia del CSV existent: {e}")
+
+        if df.height == 0:
+            return
+
+        with open(path, "a") as f:
+            df.write_csv(f, include_header=False)
