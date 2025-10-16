@@ -31,16 +31,40 @@ TRACE = os.environ.get("VITAL_TRACE", "0") == "1"
 
 # --- Tracks de tendència candidates (noms típics d’Intellivue) ---
 TREND_CANDIDATES = [
+    # Hemodinàmiques (IBP)
     "Intellivue/ABP_SYS",
     "Intellivue/ABP_DIA",
     "Intellivue/ABP_MEAN",
     "Intellivue/ABP_HR",
+
+    # ECG
     "Intellivue/ECG_HR",
-    "Intellivue/PLETH_SAT_O2",
+    "Intellivue/ECG_VPC_CNT",  # comptes de VPC
+    "Intellivue/ST_I",
+    "Intellivue/ST_II",
+    "Intellivue/ST_III",
+    "Intellivue/ST_AVR",
+    "Intellivue/ST_AVL",
+    "Intellivue/ST_AVF",
+    "Intellivue/ST_V",
+    "Intellivue/ST_MCL",
+
+    # Respiratori
     "Intellivue/RR",
+
+    # Oximetria/pleth
+    "Intellivue/PLETH_SAT_O2",
+    "Intellivue/PLETH_HR",
+    "Intellivue/PLETH_PERF_REL",
+
+    # EEG/BIS
     "Intellivue/EEG_BIS",
     "Intellivue/EEG_BIS_SQI",
+    "Intellivue/EEG_BIS_ASYM",
+
+    # Neurocritico
     "Intellivue/ICP_MEAN",
+    "Intellivue/PRESS_CEREB_PERF",  # CPP
 ]
 
 
